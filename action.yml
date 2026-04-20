@@ -1,0 +1,146 @@
+name: 'Setup Takumi Guard RubyGems Registry'
+description: 'Authenticate to the Takumi byGMO Guard RubyGems registry via OIDC. Works with Bundler.'
+author: 'GMO Flatt Security Inc.'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  bot-id:
+    description: 'Bot ID from Shisho Cloud byGMO console. Omit for anonymous mode (Tier A blocking only).'
+    required: false
+    default: ''
+  sts-url:
+    description: 'STS service URL'
+    required: false
+    default: 'https://sts.cloud.shisho.dev'
+  registry-url:
+    description: 'RubyGems registry URL'
+    required: false
+    default: 'https://rubygems.flatt.tech'
+  expires-in:
+    description: 'Token expiration in seconds (max 86400)'
+    required: false
+    default: '1800'
+  set-mirror:
+    description: 'Configure the Bundler mirror for rubygems.org globally. Set to false if you manage the mirror yourself.'
+    required: false
+    default: 'true'
+
+outputs:
+  token-expires-at:
+    description: 'ISO 8601 timestamp when the token expires'
+    value: ${{ steps.set-outputs.outputs.token-expires-at }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure registry
+      shell: bash
+      env:
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        SET_MIRROR: ${{ inputs.set-mirror }}
+      run: |
+        # Strip trailing slash, we'll re-add it in the mirror value.
+        REGISTRY_URL_NORMALIZED=$(echo "$REGISTRY_URL" | sed 's|/$||')
+
+        if [ "$SET_MIRROR" != "false" ]; then
+          # Route all rubygems.org traffic through the Takumi Guard proxy.
+          # Works for Bundler (bundle install). The `gem` CLI uses `gem sources` instead.
+          bundle config set --global "mirror.https://rubygems.org" "${REGISTRY_URL_NORMALIZED}/"
+          echo "::notice::Bundler mirror set: https://rubygems.org -> ${REGISTRY_URL_NORMALIZED}/"
+        fi
+
+    - name: Authenticate
+      id: auth
+      shell: bash
+      env:
+        BOT_ID: ${{ inputs.bot-id }}
+        STS_URL: ${{ inputs.sts-url }}
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        EXPIRES_IN: ${{ inputs.expires-in }}
+        SET_MIRROR: ${{ inputs.set-mirror }}
+      run: |
+        # Anonymous mode — no bot-id provided
+        if [ -z "$BOT_ID" ]; then
+          echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
+          exit 0
+        fi
+
+        # Get OIDC token
+        if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+          MSG="OIDC not available. Add 'permissions: { id-token: write }' to your job."
+          if [ "$SET_MIRROR" = "false" ]; then
+            echo "::error::${MSG}"
+            exit 1
+          else
+            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
+            exit 0
+          fi
+        fi
+
+        REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
+
+        OIDC_TOKEN=$(curl -sS -f \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${REGISTRY_HOST}" \
+          | jq -r '.value' 2>/dev/null) || true
+
+        if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+          MSG="Failed to get OIDC token."
+          if [ "$SET_MIRROR" = "false" ]; then
+            echo "::error::${MSG} No registry fallback available."
+            exit 1
+          else
+            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
+            exit 0
+          fi
+        fi
+
+        echo "::add-mask::${OIDC_TOKEN}"
+
+        # Exchange for STS access token
+        RESPONSE=$(curl -sS -X POST "${STS_URL}/bots/exchange" \
+          -H "Content-Type: application/json" \
+          -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}" 2>/dev/null) || true
+
+        ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token' 2>/dev/null)
+        EXPIRES_IN_ACTUAL=$(echo "$RESPONSE" | jq -r '.expires_in' 2>/dev/null)
+
+        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+          ERROR_MSG=$(echo "$RESPONSE" | jq -r '.message // "Unknown error"' 2>/dev/null)
+          MSG="Authentication failed: ${ERROR_MSG}"
+          if [ "$SET_MIRROR" = "false" ]; then
+            echo "::error::${MSG} No registry fallback available."
+            exit 1
+          else
+            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
+            exit 0
+          fi
+        fi
+
+        echo "::add-mask::${ACCESS_TOKEN}"
+
+        # Embed Basic auth into the mirror URL. Bundler sends the token on every
+        # request to the mirror host. The full URL is masked in logs.
+        AUTHENTICATED_URL="https://token:${ACCESS_TOKEN}@${REGISTRY_HOST}/"
+        echo "::add-mask::${AUTHENTICATED_URL}"
+        bundle config set --global "mirror.https://rubygems.org" "${AUTHENTICATED_URL}"
+
+        # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
+        EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+                     date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ)
+        echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Authenticated as bot ${BOT_ID} (Tier C)"
+
+    - name: Set outputs
+      id: set-outputs
+      shell: bash
+      env:
+        EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
+      run: |
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "token-expires-at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi
