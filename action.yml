@@ -36,23 +36,7 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Configure registry
-      shell: bash
-      env:
-        REGISTRY_URL: ${{ inputs.registry-url }}
-        SET_MIRROR: ${{ inputs.set-mirror }}
-      run: |
-        # Strip trailing slash, we'll re-add it in the mirror value.
-        REGISTRY_URL_NORMALIZED=$(echo "$REGISTRY_URL" | sed 's|/$||')
-
-        if [ "$SET_MIRROR" != "false" ]; then
-          # Route all rubygems.org traffic through the Takumi Guard proxy.
-          # Works for Bundler (bundle install). The `gem` CLI uses `gem sources` instead.
-          bundle config set --global "mirror.https://rubygems.org" "${REGISTRY_URL_NORMALIZED}/"
-          echo "::notice::Bundler mirror set: https://rubygems.org -> ${REGISTRY_URL_NORMALIZED}/"
-        fi
-
-    - name: Authenticate
+    - name: Authenticate and configure registry
       id: auth
       shell: bash
       env:
@@ -62,77 +46,118 @@ runs:
         EXPIRES_IN: ${{ inputs.expires-in }}
         SET_MIRROR: ${{ inputs.set-mirror }}
       run: |
-        # Anonymous mode — no bot-id provided
+        REGISTRY_URL_NORMALIZED=$(echo "$REGISTRY_URL" | sed 's|/$||')
+        REGISTRY_HOST=$(echo "$REGISTRY_URL_NORMALIZED" | sed 's|^https://||')
+
+        write_mirror() {
+          if [ "$SET_MIRROR" != "false" ]; then
+            bundle config set --global "mirror.https://rubygems.org" "$1"
+          fi
+        }
+
+        # bot-id was supplied → never silently downgrade to anonymous.
+        # Silent fallback under bot-id used to hide real auth failures
+        # behind downstream rate-limit errors that look unrelated.
+        fail_with() {
+          echo "::error::$1"
+          exit 1
+        }
+
+        # Always clean up curl response bodies, even on early-exit paths.
+        # `rm -f ""` is a silent no-op so this is safe before assignment.
+        OIDC_BODY=""
+        STS_BODY=""
+        trap 'rm -f "${OIDC_BODY:-}" "${STS_BODY:-}"' EXIT
+
         if [ -z "$BOT_ID" ]; then
           echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
+          write_mirror "${REGISTRY_URL_NORMALIZED}/"
           exit 0
         fi
 
-        # Get OIDC token
-        if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
-          MSG="OIDC not available. Add 'permissions: { id-token: write }' to your job."
-          if [ "$SET_MIRROR" = "false" ]; then
-            echo "::error::${MSG}"
-            exit 1
-          else
-            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
-            exit 0
-          fi
+        if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ] || [ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+          fail_with "OIDC not available. Add 'permissions: { id-token: write }' to your job."
         fi
 
-        REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
-
-        OIDC_TOKEN=$(curl -sS -f \
+        # --- OIDC token fetch ---
+        OIDC_BODY=$(mktemp)
+        OIDC_CURL_EXIT=0
+        OIDC_CODE=$(curl -sS -o "$OIDC_BODY" -w '%{http_code}' \
+          --max-time 15 --connect-timeout 5 \
+          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
           -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${REGISTRY_HOST}" \
-          | jq -r '.value' 2>/dev/null) || true
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${REGISTRY_HOST}") || OIDC_CURL_EXIT=$?
 
-        if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
-          MSG="Failed to get OIDC token."
-          if [ "$SET_MIRROR" = "false" ]; then
-            echo "::error::${MSG} No registry fallback available."
-            exit 1
-          else
-            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
-            exit 0
-          fi
+        if [ "$OIDC_CURL_EXIT" -ne 0 ]; then
+          fail_with "GitHub OIDC token fetch failed: curl exit ${OIDC_CURL_EXIT} (network/timeout to token.actions.githubusercontent.com)."
+        fi
+        if [ "$OIDC_CODE" != "200" ]; then
+          echo "::error::GitHub OIDC token endpoint returned HTTP ${OIDC_CODE}."
+          head -c 500 "$OIDC_BODY" | sed 's/^/::error::oidc body: /' || true
+          exit 1
         fi
 
+        # jq 1.6 exits 4 and jq 1.7 exits 5 on non-JSON input. Both die
+        # under `set -e -o pipefail` if not caught. Validate first.
+        if ! jq -e . "$OIDC_BODY" >/dev/null 2>&1; then
+          echo "::error::GitHub OIDC token endpoint returned non-JSON (HTTP ${OIDC_CODE})."
+          head -c 500 "$OIDC_BODY" | sed 's/^/::error::oidc body: /' || true
+          exit 1
+        fi
+        OIDC_TOKEN=$(jq -r '.value // empty' "$OIDC_BODY")
+        rm -f "$OIDC_BODY"
+
+        if [ -z "$OIDC_TOKEN" ]; then
+          fail_with "GitHub OIDC token response missing 'value' field."
+        fi
         echo "::add-mask::${OIDC_TOKEN}"
 
-        # Exchange for STS access token
-        RESPONSE=$(curl -sS -X POST "${STS_URL}/bots/exchange" \
+        # --- STS exchange ---
+        STS_BODY=$(mktemp)
+        STS_CURL_EXIT=0
+        STS_CODE=$(curl -sS -o "$STS_BODY" -w '%{http_code}' \
+          --max-time 15 --connect-timeout 5 \
+          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+          -X POST "${STS_URL}/bots/exchange" \
           -H "Content-Type: application/json" \
-          -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}" 2>/dev/null) || true
+          -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}") || STS_CURL_EXIT=$?
 
-        ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token' 2>/dev/null)
-        EXPIRES_IN_ACTUAL=$(echo "$RESPONSE" | jq -r '.expires_in' 2>/dev/null)
-
-        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-          ERROR_MSG=$(echo "$RESPONSE" | jq -r '.message // "Unknown error"' 2>/dev/null)
-          MSG="Authentication failed: ${ERROR_MSG}"
-          if [ "$SET_MIRROR" = "false" ]; then
-            echo "::error::${MSG} No registry fallback available."
-            exit 1
-          else
-            echo "::error::${MSG} Falling back to anonymous mode (Tier A). Logging integrity is compromised."
-            exit 0
-          fi
+        if [ "$STS_CURL_EXIT" -ne 0 ]; then
+          fail_with "STS exchange failed: curl exit ${STS_CURL_EXIT} (network/timeout reaching ${STS_URL})."
         fi
 
+        # Non-JSON STS responses (e.g. an HTML error page from an upstream
+        # layer or plaintext from a gateway) caused the silent
+        # exit-4/exit-5 failure mode this branch fixes.
+        if ! jq -e . "$STS_BODY" >/dev/null 2>&1; then
+          echo "::error::STS returned non-JSON (HTTP ${STS_CODE}). Usually indicates an outage upstream of STS."
+          head -c 500 "$STS_BODY" | sed 's/^/::error::sts body: /' || true
+          exit 1
+        fi
+
+        ACCESS_TOKEN=$(jq -r '.access_token // empty' "$STS_BODY")
+        EXPIRES_IN_ACTUAL=$(jq -r '.expires_in // 1800' "$STS_BODY")
+        STS_ERROR=$(jq -r '.message // .error // empty' "$STS_BODY")
+        rm -f "$STS_BODY"
+
+        if [ -z "$ACCESS_TOKEN" ]; then
+          if [ "$STS_CODE" = "401" ] || [ "$STS_CODE" = "403" ]; then
+            fail_with "STS rejected bot-id (HTTP ${STS_CODE}): ${STS_ERROR:-no message}. Check that bot-id is valid and the workflow's OIDC subject is allowed."
+          fi
+          fail_with "STS returned HTTP ${STS_CODE} without an access_token: ${STS_ERROR:-no message}."
+        fi
         echo "::add-mask::${ACCESS_TOKEN}"
 
-        # Embed Basic auth into the mirror URL. Bundler sends the token on every
-        # request to the mirror host. The full URL is masked in logs.
         AUTHENTICATED_URL="https://token:${ACCESS_TOKEN}@${REGISTRY_HOST}/"
         echo "::add-mask::${AUTHENTICATED_URL}"
-        bundle config set --global "mirror.https://rubygems.org" "${AUTHENTICATED_URL}"
+        write_mirror "$AUTHENTICATED_URL"
 
-        # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
-        EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
-                     date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ)
-        echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
-
+        EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                     || date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                     || echo "")
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi
         echo "::notice::Authenticated as bot ${BOT_ID} (Tier C)"
 
     - name: Set outputs
