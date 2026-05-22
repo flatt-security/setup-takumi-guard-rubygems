@@ -129,7 +129,7 @@ steps:
 
 **Key details:**
 - Auth is handled via **GitHub's built-in OIDC** -- no PATs or secrets to rotate.
-- If authentication fails, **blocking remains active** but logging is degraded. The build continues with a warning.
+- If authentication fails (invalid `bot-id`, missing OIDC permission, STS unreachable, transient upstream error), the action exits with a clear error message and the build fails. There is no silent fallback to blocking-only mode.
 - Get a Bot ID from [Shisho Cloud byGMO](https://cloud.shisho.dev).
 
 ---
@@ -198,9 +198,9 @@ Unlike npm, RubyGems does not embed the registry URL into `Gemfile.lock`. Most p
 | Error | Cause | Fix |
 |---|---|---|
 | `OIDC not available` | Missing permission on the job | Add `permissions: { id-token: write }` to your job |
-| `invalid ID token` | Trust condition mismatch | Check the bot's trust settings in Shisho Cloud byGMO |
-| `invalid request` | Malformed bot-id | Double-check the bot-id value from your console |
-| `Authentication failed ... Falling back` | STS token exchange failed | Verify bot-id and trust settings. Blocking is still active. |
+| `STS returned non-JSON (HTTP N)` | An error response from STS or an upstream layer was not valid JSON (e.g. an HTML error page from a transient outage) | Usually a transient infrastructure issue. The HTTP status and a body snippet are echoed to the log to help diagnose. |
+| `STS returned HTTP N without an access_token` | STS rejected the auth request | The job log includes STS's own message inside this error. Common cases: `invalid ID token` -- trust condition mismatch, check the bot's trust settings in Shisho Cloud byGMO; `invalid request` -- malformed bot-id, double-check the value from your console. |
+| `GitHub OIDC token fetch failed` | Could not reach `token.actions.githubusercontent.com` or got a non-200 response | Usually transient; the action retries up to 3 times. Persistent failures point at a GitHub Actions issue. |
 | `bundle: command not found` | Ruby/Bundler not installed before this action | Add `ruby/setup-ruby@v1` before `setup-takumi-guard-rubygems` |
 | `Could not find gem X` after enabling | Gem is blocked, or `bundler-cache` served a stale resolution | Run `bundle install --redownload` once, or clear the action cache |
 
