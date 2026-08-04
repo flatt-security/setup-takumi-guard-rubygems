@@ -182,6 +182,7 @@ Unlike npm, RubyGems does not embed the registry URL into `Gemfile.lock`. Most p
 | `registry-url` | No | `https://rubygems.flatt.tech` | Registry endpoint. |
 | `sts-url` | No | `https://sts.cloud.shisho.dev` | STS endpoint for token exchange. |
 | `expires-in` | No | `1800` | Token lifetime in seconds (max 86400). |
+| `audience` | No | `https://sts.cloud.shisho.dev` (the STS URL) | Audience for the OIDC token request. Override when your Bot trust condition expects a different value. |
 
 ---
 
@@ -199,7 +200,7 @@ Unlike npm, RubyGems does not embed the registry URL into `Gemfile.lock`. Most p
 |---|---|---|
 | `OIDC not available` | Missing permission on the job | Add `permissions: { id-token: write }` to your job |
 | `STS returned non-JSON (HTTP N)` | An error response from STS or an upstream layer was not valid JSON (e.g. an HTML error page from a transient outage) | Usually a transient infrastructure issue. The HTTP status and a body snippet are echoed to the log to help diagnose. |
-| `STS returned HTTP N without an access_token` | STS rejected the auth request | The job log includes STS's own message inside this error. Common cases: `invalid ID token` -- trust condition mismatch, check the bot's trust settings in Shisho Cloud byGMO; `invalid request` -- malformed bot-id, double-check the value from your console. |
+| `STS returned HTTP N without an access_token` | STS rejected the auth request | The job log includes STS's own message inside this error. Common cases: `invalid ID token` -- trust condition mismatch, check the bot's trust settings in Shisho Cloud byGMO (if the trust condition sets an audience, it must equal the value the action sends -- by default the STS URL, overridable via the `audience` input); `invalid request` -- malformed bot-id, double-check the value from your console. |
 | `GitHub OIDC token fetch failed` | Could not reach `token.actions.githubusercontent.com` or got a non-200 response | Usually transient; the action retries up to 3 times. Persistent failures point at a GitHub Actions issue. |
 | `bundle: command not found` | Ruby/Bundler not installed before this action | Add `ruby/setup-ruby@v1` before `setup-takumi-guard-rubygems` |
 | `Could not find gem X` after enabling | Gem is blocked, or `bundler-cache` served a stale resolution | Run `bundle install --redownload` once, or clear the action cache |
