@@ -5,6 +5,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -23,3 +26,16 @@ jobs:
           grep -q "set-mirror:" action.yml
           grep -q "rubygems.flatt.tech" action.yml
           echo "Required fields present"
+
+  outputs:
+    # Runs the auth and set-outputs steps against local mocks, so the job needs
+    # neither id-token permission nor egress.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Token output
+        run: bash test/outputs_test.sh
