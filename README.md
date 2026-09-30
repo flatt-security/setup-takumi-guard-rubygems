@@ -190,7 +190,29 @@ Unlike npm, RubyGems does not embed the registry URL into `Gemfile.lock`. Most p
 
 | Output | Description |
 |---|---|
+| `token` | The access token for the registry. Only set when authenticated. |
 | `token-expires-at` | ISO 8601 timestamp of token expiration. Only set when authenticated. |
+
+The `token` output lets a step hand the token to a tool that does not read the runner's `~/.bundle/config`, such as a Docker container that does not mount it. Pass it through `env:` and name the variable without its value, so the token does not appear on the command line:
+
+```yaml
+- uses: flatt-security/setup-takumi-guard-rubygems@v1
+  id: guard
+  with:
+    bot-id: 'BT01...'
+
+- name: Install in a container
+  env:
+    GUARD_TOKEN: ${{ steps.guard.outputs.token }}
+  run: |
+    docker run --rm -e GUARD_TOKEN \
+      -v "$PWD:/src" -w /src ruby:3.3 \
+      sh -c 'export BUNDLE_RUBYGEMS__FLATT__TECH="token:$GUARD_TOKEN" && bundle config set --global mirror.https://rubygems.org https://rubygems.flatt.tech/ && bundle install'
+```
+
+`BUNDLE_RUBYGEMS__FLATT__TECH` holds the credentials for `rubygems.flatt.tech`. If you set `registry-url`, use its host in both the variable name and the mirror. Bundler names the variable `BUNDLE_` followed by the host in upper case, with each `.` replaced by `__` and each `-` by `___`: `my-registry.example.com` becomes `BUNDLE_MY___REGISTRY__EXAMPLE__COM`.
+
+The token is a credential for your bot. Do not pass it with `docker build --build-arg` or write it into an image, because build arguments and image layers keep it after the job ends; use a BuildKit secret (`docker build --secret`) instead.
 
 ---
 
