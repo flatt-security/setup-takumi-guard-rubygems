@@ -247,7 +247,7 @@ The token is a credential for your bot. Do not pass it with `docker build --buil
 
 - **Short-lived tokens** -- 30 minutes by default, 24 hours max.
 - **Auto-masked** -- Access tokens are automatically masked in workflow logs.
-- **Global bundle config** -- The action writes to `~/.bundle/config` on the ephemeral runner, or to the file that `BUNDLE_USER_CONFIG` or `BUNDLE_USER_HOME` points to. Your repository's committed `.bundle/config` is not modified.
+- **Global bundle config** -- The action writes to `~/.bundle/config` on the ephemeral runner, or to the file that `BUNDLE_CONFIG`, `BUNDLE_USER_CONFIG` or `BUNDLE_USER_HOME` points to, in that order, as Bundler reads them. Your repository's committed `.bundle/config` is not modified.
 - **Basic auth over HTTPS** -- Bundler sends `Authorization: Basic <base64(token:ACCESS_TOKEN)>` to `rubygems.flatt.tech`. The token is never written to any file tracked by git.
 
 ---

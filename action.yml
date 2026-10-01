@@ -58,7 +58,9 @@ runs:
         REGISTRY_HOST=$(echo "$REGISTRY_URL_NORMALIZED" | sed 's|^https://||')
 
         # Bundler's user configuration file, located the way Bundler locates it.
-        if [ -n "${BUNDLE_USER_CONFIG:-}" ]; then
+        if [ -n "${BUNDLE_CONFIG:-}" ]; then
+          BUNDLE_CONFIG_FILE="$BUNDLE_CONFIG"
+        elif [ -n "${BUNDLE_USER_CONFIG:-}" ]; then
           BUNDLE_CONFIG_FILE="$BUNDLE_USER_CONFIG"
         else
           BUNDLE_CONFIG_FILE="${BUNDLE_USER_HOME:-$HOME/.bundle}/config"

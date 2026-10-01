@@ -4,9 +4,10 @@
 # configuration.
 #
 # The auth step is extracted from action.yml and run in anonymous mode, which
-# needs no network. Cases 1 to 3 read the result back with `bundle config
-# get`, so Bundler 2.1 or later must be on PATH. Cases 4 and 4b rely on file
-# permissions and must run as a non-root user. Case 10 needs real symlinks.
+# needs no network. Cases 1 to 3, 5, 5b and 6 read the result back with
+# `bundle config get`, so Bundler 2.1 or later must be on PATH. Cases 4 and 4b
+# rely on file permissions and must run as a non-root user. Case 10 needs real
+# symlinks.
 set -u -o pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -75,9 +76,10 @@ fresh_home() {
   mkdir -p "$WORK/home"
 }
 
-bundle_get() { # <setting> -> the value Bundler resolves, with HOME=$WORK/home
-  (cd "$WORK" && HOME="$WORK/home" bundle config get --parseable "$1" 2>/dev/null) \
-    | awk -v k="$1=" 'index($0, k) == 1 { print substr($0, length(k) + 1) }'
+bundle_get() { # <setting> [VAR=value ...] -> the value Bundler resolves, with HOME=$WORK/home
+  local setting=$1; shift
+  (cd "$WORK" && env HOME="$WORK/home" "$@" bundle config get --parseable "$setting" 2>/dev/null) \
+    | awk -v k="$setting=" 'index($0, k) == 1 { print substr($0, length(k) + 1) }'
 }
 
 if [ "$(id -u)" = 0 ]; then
@@ -155,6 +157,21 @@ run_auth BUNDLE_USER_CONFIG="$WORK/home/elsewhere/bundler.yml"
 check "auth exit" 0 "$AUTH_EXIT"
 check "written to BUNDLE_USER_CONFIG" 1 "$(grep -cF "$MIRROR_LINE" "$WORK/home/elsewhere/bundler.yml" 2>/dev/null)"
 check "~/.bundle/config" "absent" "$([ -e "$WORK/home/.bundle/config" ] && echo present || echo absent)"
+check "Bundler resolves the mirror" "https://rubygems.flatt.tech/" \
+  "$(bundle_get mirror.https://rubygems.org BUNDLE_USER_CONFIG="$WORK/home/elsewhere/bundler.yml")"
+
+# --- 5b: BUNDLE_CONFIG ------------------------------------------------------------
+# Bundler reads BUNDLE_CONFIG before BUNDLE_USER_CONFIG, so with both set the
+# mirror must go to BUNDLE_CONFIG.
+start_case "5b: BUNDLE_CONFIG names the file and wins over BUNDLE_USER_CONFIG"
+fresh_home
+run_auth BUNDLE_CONFIG="$WORK/home/bundle-config.yml" BUNDLE_USER_CONFIG="$WORK/home/user-config.yml"
+check "auth exit" 0 "$AUTH_EXIT"
+check "written to BUNDLE_CONFIG" 1 "$(grep -cF "$MIRROR_LINE" "$WORK/home/bundle-config.yml" 2>/dev/null)"
+check "BUNDLE_USER_CONFIG file" "absent" "$([ -e "$WORK/home/user-config.yml" ] && echo present || echo absent)"
+check "~/.bundle/config" "absent" "$([ -e "$WORK/home/.bundle/config" ] && echo present || echo absent)"
+check "Bundler resolves the mirror" "https://rubygems.flatt.tech/" \
+  "$(bundle_get mirror.https://rubygems.org BUNDLE_CONFIG="$WORK/home/bundle-config.yml" BUNDLE_USER_CONFIG="$WORK/home/user-config.yml")"
 
 # --- 6: BUNDLE_USER_HOME --------------------------------------------------------
 start_case "6: BUNDLE_USER_HOME names the directory"
@@ -163,6 +180,8 @@ run_auth BUNDLE_USER_HOME="$WORK/home/bundle-home"
 check "auth exit" 0 "$AUTH_EXIT"
 check "written to BUNDLE_USER_HOME/config" 1 "$(grep -cF "$MIRROR_LINE" "$WORK/home/bundle-home/config" 2>/dev/null)"
 check "~/.bundle/config" "absent" "$([ -e "$WORK/home/.bundle/config" ] && echo present || echo absent)"
+check "Bundler resolves the mirror" "https://rubygems.flatt.tech/" \
+  "$(bundle_get mirror.https://rubygems.org BUNDLE_USER_HOME="$WORK/home/bundle-home")"
 
 # --- 7: no Bundler --------------------------------------------------------------
 start_case "7: works when Bundler is not installed"
