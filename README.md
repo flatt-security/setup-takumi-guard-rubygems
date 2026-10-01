@@ -38,7 +38,7 @@ Every `bundle install` in your CI is a trust decision. Takumi Guard sits between
 
 - **How it works** -- Routes installs through a security proxy (`rubygems.flatt.tech`) that checks gems against a threat database in real time.
 - **What you change** -- One step in your workflow YAML. No Gemfile edits, no secrets to manage.
-- **What it supports** -- **Bundler** (via `bundle config mirror`). For direct `gem install` usage, see the [appendix](#appendix-email-registration--token-management).
+- **What it supports** -- **Bundler** (via a mirror in Bundler's configuration). For direct `gem install` usage, see the [appendix](#appendix-email-registration--token-management).
 
 ---
 
@@ -51,17 +51,16 @@ Every `bundle install` in your CI is a trust decision. Takumi Guard sits between
 ```yaml
 steps:
   - uses: actions/checkout@v4
-  - uses: ruby/setup-ruby@v1
-    with:
-      bundler-cache: true
 
   - uses: flatt-security/setup-takumi-guard-rubygems@v1   # <-- add this line
 
-  - run: bundle install
+  - uses: ruby/setup-ruby@v1
+    with:
+      bundler-cache: true
   - run: bundle exec rspec
 ```
 
-> **Ordering:** Put this action *before* `bundle install`. If `ruby/setup-ruby` is configured with `bundler-cache: true`, put it *after* `ruby/setup-ruby` but *before* any step that triggers `bundle install`.
+> **Ordering:** Put this action *before* any step that runs `bundle install`. That includes `ruby/setup-ruby` with `bundler-cache: true`, which runs `bundle install` itself. The action does not need Ruby or Bundler, so it can be the first step after checkout.
 
 **Step 2.** Push the change. Every `bundle install` in this job now runs through the Takumi Guard proxy. Malicious gems are blocked automatically.
 
@@ -76,13 +75,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@v1
 
       - uses: flatt-security/setup-takumi-guard-rubygems@v1
         with:
           bot-id: "YOUR_BOT_ID"
 
-      - run: bundle install
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
 ```
 
 > **Where do I get a Bot ID?** Create one at [Shisho Cloud byGMO](https://cloud.shisho.dev) -- or skip this entirely. Blocking works without it. The Bot ID is a public reference key, not a secret.
@@ -151,6 +151,7 @@ steps:
   ```bash
   bundle config set --global mirror.https://rubygems.org https://rubygems.flatt.tech
   ```
+- That command needs Bundler, so it runs after `ruby/setup-ruby`. With `bundler-cache: true`, the `bundle install` inside `ruby/setup-ruby` runs before your mirror is set and does not go through the proxy. Run `bundle install` in a later step instead of using `bundler-cache: true`.
 - If authentication fails, **the action exits with an error** -- there is no fallback.
 
 ---
@@ -159,7 +160,18 @@ steps:
 
 Unlike npm, RubyGems does not embed the registry URL into `Gemfile.lock`. Most projects can adopt Takumi Guard without any lockfile changes.
 
-**For Bundler:** No migration needed. The action configures `bundle config mirror.https://rubygems.org` and every `bundle install` automatically routes through the proxy. Your `Gemfile` continues to say `source 'https://rubygems.org'` -- Bundler silently uses the mirror.
+**For Bundler:** No migration needed. The action writes a mirror for `https://rubygems.org` to Bundler's user configuration (`~/.bundle/config`), and every `bundle install` automatically routes through the proxy. Your `Gemfile` continues to say `source 'https://rubygems.org'` -- Bundler silently uses the mirror.
+
+**If you use `bundler-cache: true`:** A cache that `ruby/setup-ruby` saved before the mirror was set holds gems fetched directly from rubygems.org, and the cache key does not change when the mirror does, so that cache keeps being restored. Change `cache-version` once so that the next run installs through the proxy:
+
+```yaml
+- uses: ruby/setup-ruby@v1
+  with:
+    bundler-cache: true
+    cache-version: 1
+```
+
+A run that restores the cache installs nothing, so it sends no request to the proxy. The gems in a cache saved after you changed `cache-version` went through the proxy when that cache was saved; they are not checked again when the cache is restored, even if one of them is found to be malicious later.
 
 **For gems installed via `gem install`:** The action does *not* reroute `gem install` (only Bundler). If your workflow installs gems outside Bundler, add a `gem sources` step:
 
@@ -178,7 +190,7 @@ Unlike npm, RubyGems does not embed the registry URL into `Gemfile.lock`. Most p
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `bot-id` | No | -- | Bot ID from Shisho Cloud byGMO. Omit for blocking-only mode. |
-| `set-mirror` | No | `true` | Run `bundle config set --global mirror.https://rubygems.org <registry-url>`. Set to `false` if you manage the mirror yourself. |
+| `set-mirror` | No | `true` | Write `<registry-url>` as the mirror for `https://rubygems.org` to Bundler's user configuration (`~/.bundle/config`). Set to `false` if you manage the mirror yourself. |
 | `registry-url` | No | `https://rubygems.flatt.tech` | Registry endpoint. |
 | `sts-url` | No | `https://sts.cloud.shisho.dev` | STS endpoint for token exchange. |
 | `expires-in` | No | `1800` | Token lifetime in seconds (max 86400). |
@@ -224,7 +236,7 @@ The token is a credential for your bot. Do not pass it with `docker build --buil
 | `STS returned non-JSON (HTTP N)` | An error response from STS or an upstream layer was not valid JSON (e.g. an HTML error page from a transient outage) | Usually a transient infrastructure issue. The HTTP status and a body snippet are echoed to the log to help diagnose. |
 | `STS returned HTTP N without an access_token` | STS rejected the auth request | The job log includes STS's own message inside this error. Common cases: `invalid ID token` -- trust condition mismatch, check the bot's trust settings in Shisho Cloud byGMO (if the trust condition sets an audience, it must equal the value the action sends -- by default the STS URL, overridable via the `audience` input); `invalid request` -- malformed bot-id, double-check the value from your console. |
 | `GitHub OIDC token fetch failed` | Could not reach `token.actions.githubusercontent.com` or got a non-200 response | Usually transient; the action retries up to 3 times. Persistent failures point at a GitHub Actions issue. |
-| `bundle: command not found` | Ruby/Bundler not installed before this action | Add `ruby/setup-ruby@v1` before `setup-takumi-guard-rubygems` |
+| Gems are still fetched from `rubygems.org` | Your repository's `.bundle/config` sets its own mirror for `https://rubygems.org`, which takes precedence over the user configuration the action writes. `bundle config get mirror.https://rubygems.org` shows which value is used. | Remove that setting from the repository, or use `set-mirror: false` and manage the mirror yourself |
 | `Could not find gem X` after enabling | Gem is blocked, or `bundler-cache` served a stale resolution | Run `bundle install --redownload` once, or clear the action cache |
 
 > **Still stuck?** Open an issue on this repository with your error output and workflow file (redact any IDs).
@@ -235,7 +247,7 @@ The token is a credential for your bot. Do not pass it with `docker build --buil
 
 - **Short-lived tokens** -- 30 minutes by default, 24 hours max.
 - **Auto-masked** -- Access tokens are automatically masked in workflow logs.
-- **Global bundle config** -- The action writes to `~/.bundle/config` on the ephemeral runner. Your repository's committed `.bundle/config` is not modified.
+- **Global bundle config** -- The action writes to `~/.bundle/config` on the ephemeral runner, or to the file that `BUNDLE_USER_CONFIG` or `BUNDLE_USER_HOME` points to. Your repository's committed `.bundle/config` is not modified.
 - **Basic auth over HTTPS** -- Bundler sends `Authorization: Basic <base64(token:ACCESS_TOKEN)>` to `rubygems.flatt.tech`. The token is never written to any file tracked by git.
 
 ---
