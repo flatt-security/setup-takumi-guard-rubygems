@@ -4,9 +4,8 @@
 #
 # The auth and set-outputs steps are extracted from action.yml and run
 # directly against local OIDC and STS mocks, so no test here needs
-# `id-token: write` or network access. The auth step runs the real `bundle`,
-# which must be on PATH. The set-outputs step is fed exactly what the auth
-# step wrote to GITHUB_OUTPUT, which is how the runner wires
+# `id-token: write` or network access. The set-outputs step is fed exactly
+# what the auth step wrote to GITHUB_OUTPUT, which is how the runner wires
 # `steps.auth.outputs.*` into it.
 set -u -o pipefail
 

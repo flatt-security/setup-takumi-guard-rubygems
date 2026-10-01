@@ -57,10 +57,37 @@ runs:
         REGISTRY_URL_NORMALIZED=$(echo "$REGISTRY_URL" | sed 's|/$||')
         REGISTRY_HOST=$(echo "$REGISTRY_URL_NORMALIZED" | sed 's|^https://||')
 
+        # Bundler's user configuration file, located the way Bundler locates it.
+        if [ -n "${BUNDLE_CONFIG:-}" ]; then
+          BUNDLE_CONFIG_FILE="$BUNDLE_CONFIG"
+        elif [ -n "${BUNDLE_USER_CONFIG:-}" ]; then
+          BUNDLE_CONFIG_FILE="$BUNDLE_USER_CONFIG"
+        else
+          BUNDLE_CONFIG_FILE="${BUNDLE_USER_HOME:-$HOME/.bundle}/config"
+        fi
+        MIRROR_KEY='BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/'
+
+        # Sets the rubygems.org mirror in Bundler's user configuration and
+        # keeps every other setting in it. The file is written directly, so
+        # this step does not need Ruby or Bundler to be installed yet.
         write_mirror() {
-          if [ "$SET_MIRROR" != "false" ]; then
-            bundle config set --global "mirror.https://rubygems.org" "$1"
+          if [ "$SET_MIRROR" = "false" ]; then
+            return 0
           fi
+          mkdir -p "$(dirname "$BUNDLE_CONFIG_FILE")" \
+            || fail_with "cannot create $(dirname "$BUNDLE_CONFIG_FILE")"
+          CONFIG_TMP=$(mktemp "${BUNDLE_CONFIG_FILE}.XXXXXX") \
+            || fail_with "cannot write to $(dirname "$BUNDLE_CONFIG_FILE")"
+          if [ -e "$BUNDLE_CONFIG_FILE" ]; then
+            awk -v k="${MIRROR_KEY}:" 'index($0, k) != 1' "$BUNDLE_CONFIG_FILE" > "$CONFIG_TMP" \
+              || fail_with "cannot read ${BUNDLE_CONFIG_FILE}"
+          else
+            echo '---' > "$CONFIG_TMP"
+          fi
+          printf '%s: "%s"\n' "$MIRROR_KEY" "$1" >> "$CONFIG_TMP"
+          cat "$CONFIG_TMP" > "$BUNDLE_CONFIG_FILE" \
+            || fail_with "cannot write ${BUNDLE_CONFIG_FILE}"
+          rm -f "$CONFIG_TMP"
         }
 
         # bot-id was supplied → never silently downgrade to anonymous.
@@ -71,11 +98,13 @@ runs:
           exit 1
         }
 
-        # Always clean up curl response bodies, even on early-exit paths.
+        # Always clean up curl response bodies and the configuration being
+        # written, even on early-exit paths.
         # `rm -f ""` is a silent no-op so this is safe before assignment.
         OIDC_BODY=""
         STS_BODY=""
-        trap 'rm -f "${OIDC_BODY:-}" "${STS_BODY:-}"' EXIT
+        CONFIG_TMP=""
+        trap 'rm -f "${OIDC_BODY:-}" "${STS_BODY:-}" "${CONFIG_TMP:-}"' EXIT
 
         if [ -z "$BOT_ID" ]; then
           echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"

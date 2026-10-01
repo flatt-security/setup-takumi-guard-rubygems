@@ -39,3 +39,60 @@ jobs:
 
       - name: Token output
         run: bash test/outputs_test.sh
+
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Bundler mirror configuration
+        run: bash test/mirror_test.sh
+
+  # The action runs before ruby/setup-ruby, so the bundle install that
+  # bundler-cache starts must go to the mirror. The mirror is unreachable, so
+  # that install fails and names it.
+  order:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          registry-url: https://mirror.invalid
+      - id: setup-ruby
+        continue-on-error: true
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          working-directory: test/fixtures/bundler-cache
+          bundler-cache: true
+          cache-version: ${{ github.run_id }}-order
+
+      - name: The install went to the mirror
+        working-directory: test/fixtures/bundler-cache
+        env:
+          OUTCOME: ${{ steps.setup-ruby.outcome }}
+        run: |
+          [ "$OUTCOME" = failure ] || { echo "::error::setup-ruby outcome is ${OUTCOME}, expected failure"; exit 1; }
+          # setup-ruby got as far as its own bundle install: Ruby is installed,
+          # and the deployment setting it writes just before the install is set.
+          case "$(ruby -e 'print RUBY_VERSION')" in 3.3.*) ;; *) echo "::error::Ruby 3.3 is not installed"; exit 1 ;; esac
+          grep -q '^BUNDLE_DEPLOYMENT: "true"$' .bundle/config || { echo "::error::setup-ruby did not reach its bundle install"; exit 1; }
+          set +e
+          bundle install > "$RUNNER_TEMP/install.log" 2>&1
+          cat "$RUNNER_TEMP/install.log"
+          grep -q 'mirror.invalid' "$RUNNER_TEMP/install.log" || { echo "::error::bundle install did not try the mirror"; exit 1; }
+
+  # Control for the order job: without the action, the same setup-ruby succeeds.
+  order-control:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          working-directory: test/fixtures/bundler-cache
+          bundler-cache: true
+          cache-version: ${{ github.run_id }}-order-control
